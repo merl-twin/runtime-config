@@ -1,0 +1,10 @@
+[package]
+name = "runtime-config"
+version = "0.1.0"
+authors = ["merl <merl.001.mia@gmail.com>"]
+edition = "2021"
+
+[dependencies]
+crossbeam = "0.8"
+log = "0.4"
+
