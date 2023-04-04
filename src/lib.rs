@@ -5,18 +5,23 @@ use std::{
     collections::BTreeMap,
 };
 
-
+use oneshot::{OneSet,OneGet};
 
 pub struct FileEvent<T> {
     pub opaque: T,
     pub content: FileContent,
 }
 
+#[derive(Debug,Clone)]
 pub enum FileContent {
-    Init(String),
-    Update(String),
+    Text(String),
     Remove,
-    Error(std::io::Error),
+    Error(String),
+}
+impl From<std::io::Error> for FileContent {
+    fn from(e: std::io::Error) -> FileContent {
+        FileContent::Error(e.to_string())
+    }
 }
 
 #[derive(Clone,Copy)]
@@ -29,12 +34,13 @@ enum WatchTask<T> {
         opaque: T,
         tp: FileType,
         path: PathBuf,
+        result: OneSet<FileContent>,
     },
     Unwatch(PathBuf),
 }
 
 struct Watch<T> {
-    opaque: T,
+    opaque: Vec<T>,
     tp: FileType,
     modified: std::time::SystemTime,
 }
@@ -52,101 +58,6 @@ pub struct FileWatcher<T: Clone + Send + 'static> {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
-struct FileWatcherInner<T: Clone> {
-    sender: crossbeam::channel::Sender<FileEvent<T>>,
-    tasks: BTreeMap<PathBuf,Watch<T>>,
-    timeout: std::time::Duration,
-}
-impl<T: Clone> FileWatcherInner<T> {
-    fn new(sender: crossbeam::channel::Sender<FileEvent<T>>) -> FileWatcherInner<T>
-    {
-        FileWatcherInner {
-            sender,
-            timeout: std::time::Duration::new(1,0),
-            tasks: BTreeMap::new(),
-        }
-    }
-    fn task(&mut self, task: WatchTask<T>) {
-        match task {
-            WatchTask::Watch{ opaque, tp, path } => match self.tasks.get_mut(&path) {
-                Some(tsk) => {
-                    tsk.opaque = opaque;
-                    tsk.tp = tp;
-                },
-                None => {
-                    let (opt_w,ev) = FileWatcherInner::init(opaque,tp,&path);
-                    if let Some(w) = opt_w {
-                        self.tasks.insert(path,w);
-                    }
-                    self.sender.send(ev).ok();
-                },
-            },
-            WatchTask::Unwatch(path) => {
-                self.tasks.remove(&path);
-            },
-        }
-    }
-
-    fn init(opaque: T, tp: FileType, path: &PathBuf) -> (Option<Watch<T>>,FileEvent<T>) {
-        fn path_to_file(path: &PathBuf) -> Result<(std::time::SystemTime,fs::File),std::io::Error> {
-            let mtime = fs::metadata(path)?.modified()?;
-            let fl = fs::File::open(path)?;
-            Ok((mtime,fl))            
-        }
-
-        match path_to_file(path) {
-            Err(e) => (None,FileEvent{ opaque, content: FileContent::Error(e) }),
-            Ok((mtime,fl)) => {
-                match tp {
-                    FileType::Text => {
-                        let mut rdr = std::io::BufReader::new(fl);
-                        let mut s = String::new();
-                        match rdr.read_to_string(&mut s) {
-                            Ok(_) => (Some(Watch { opaque: opaque.clone(), tp, modified: mtime }),FileEvent{ opaque, content: FileContent::Init(s) }),
-                            Err(e) => (None,FileEvent{ opaque, content: FileContent::Error(e) }),
-                        }
-                    },
-                }
-            },
-        }
-    }
-
-    fn check(&mut self) {
-        fn path_to_meta(path: &PathBuf) -> Result<std::time::SystemTime,std::io::Error> {
-            fs::metadata(path)?.modified()         
-        }
-        
-        let mut to_remove = Vec::new();
-        for (path,watch) in &mut self.tasks {
-            match path_to_meta(path) {
-                Ok(mtime) => match mtime > watch.modified {
-                    true => match fs::File::open(path) {
-                        Ok(fl) => match watch.tp {
-                            FileType::Text => {
-                                let mut rdr = std::io::BufReader::new(fl);
-                                let mut s = String::new();
-                                let event = match rdr.read_to_string(&mut s) {
-                                    Ok(_) => {
-                                        watch.modified = mtime;
-                                        FileEvent{ opaque: watch.opaque.clone(), content: FileContent::Update(s) }
-                                    },
-                                    Err(e) => FileEvent{ opaque: watch.opaque.clone(), content: FileContent::Error(e) },
-                                };
-                                self.sender.send(event).ok();
-                            },
-                        },
-                        Err(_) => to_remove.push(path.clone()),
-                    },
-                    false => continue,
-                },
-                Err(_) => to_remove.push(path.clone()),
-            }
-        }
-        for path in to_remove {
-            self.tasks.remove(&path);
-        }
-    }
-}
 
 impl<T: Clone + Send + 'static> FileWatcher<T> {
     pub fn new() -> FileWatcher<T> {
@@ -177,15 +88,18 @@ impl<T: Clone + Send + 'static> FileWatcher<T> {
         }
     }
 
-    pub fn add_watch<P: Into<PathBuf>>(&self, tp: FileType, path: P, opaque: T) {
+    pub fn add_watch<P: Into<PathBuf>>(&self, tp: FileType, path: P, opaque: T) -> OneGet<FileContent> {
+        let (os,og) = oneshot::oneshot();
         let task = WatchTask::Watch {
             opaque,
             tp,
             path: path.into(),
+            result: os,
         };
         if let Some(sender) = &self.sender {
             sender.send(task).ok();
         }
+        og
     }
 
     pub fn remove_watch<P: Into<PathBuf>>(&self, path: P) {
@@ -221,5 +135,116 @@ impl<T: Clone + Send + 'static> Drop for FileWatcher<T> {
             }
         }
         log::info!("Terminated file-watcher");
+    }
+}
+
+struct FileWatcherInner<T: Clone> {
+    sender: crossbeam::channel::Sender<FileEvent<T>>,
+    tasks: BTreeMap<PathBuf,Watch<T>>,
+    timeout: std::time::Duration,
+}
+impl<T: Clone> FileWatcherInner<T> {
+    fn new(sender: crossbeam::channel::Sender<FileEvent<T>>) -> FileWatcherInner<T>
+    {
+        FileWatcherInner {
+            sender,
+            timeout: std::time::Duration::new(1,0),
+            tasks: BTreeMap::new(),
+        }
+    }
+    fn task(&mut self, task: WatchTask<T>) {
+        match task {
+            WatchTask::Watch{ opaque, tp, path, result } => match self.tasks.get_mut(&path) {
+                Some(tsk) => {
+                    tsk.opaque.push(opaque);
+                    let c = match fs::File::open(path) {
+                        Ok(fl) => match tp {
+                            FileType::Text => {
+                                let mut rdr = std::io::BufReader::new(fl);
+                                let mut s = String::new();
+                                match rdr.read_to_string(&mut s) {
+                                    Ok(_) => FileContent::Text(s),
+                                    Err(e) => e.into(),
+                                }
+                            },
+                        },
+                        Err(e) => e.into(),
+                    };
+                    result.set(c);
+                },
+                None => {
+                    if let Some(w) = FileWatcherInner::init(opaque,tp,result,&path) {
+                        self.tasks.insert(path,w);
+                    }
+                },
+            },
+            WatchTask::Unwatch(path) => {
+                self.tasks.remove(&path);
+            },
+        }
+    }
+
+    fn init(opaque: T, tp: FileType, result: OneSet<FileContent>, path: &PathBuf) -> Option<Watch<T>> {
+        fn path_to_file(path: &PathBuf) -> Result<(std::time::SystemTime,fs::File),std::io::Error> {
+            let mtime = fs::metadata(path)?.modified()?;
+            let fl = fs::File::open(path)?;
+            Ok((mtime,fl))            
+        }
+
+        let (w,c) = match path_to_file(path) {
+            Err(e) => (None,e.into()),
+            Ok((mtime,fl)) => {
+                match tp {
+                    FileType::Text => {
+                        let mut rdr = std::io::BufReader::new(fl);
+                        let mut s = String::new();
+                        match rdr.read_to_string(&mut s) {
+                            Ok(_) => (Some(Watch { opaque: vec![opaque], tp, modified: mtime }),FileContent::Text(s)),
+                            Err(e) => (None,e.into()),
+                        }
+                    },
+                }
+            },
+        };
+        result.set(c);
+        w
+    }
+
+    fn check(&mut self) {
+        fn path_to_meta(path: &PathBuf) -> Result<std::time::SystemTime,std::io::Error> {
+            fs::metadata(path)?.modified()         
+        }
+        
+        let mut to_remove = Vec::new();
+        for (path,watch) in &mut self.tasks {
+            match path_to_meta(path) {
+                Ok(mtime) => match mtime > watch.modified {
+                    true => match fs::File::open(path) {
+                        Ok(fl) => match watch.tp {
+                            FileType::Text => {
+                                let mut rdr = std::io::BufReader::new(fl);
+                                let mut s = String::new();
+                                let event_cont = match rdr.read_to_string(&mut s) {
+                                    Ok(_) => {
+                                        watch.modified = mtime;                                        
+                                        FileContent::Text(s)
+                                    },
+                                    Err(e) => e.into(),
+                                };
+                                for op in &watch.opaque {                                    
+                                    self.sender.send(FileEvent{ opaque: op.clone(), content: event_cont.clone() }).ok();
+                                }
+                            },
+                        },
+                        Err(_) => to_remove.push(path.clone()),
+                    },
+                    false => continue,
+                },
+                Err(_) => to_remove.push(path.clone()),
+            }
+        }
+        for path in to_remove {
+            self.tasks.remove(&path);
+        }
     }
 }

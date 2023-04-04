@@ -5,6 +5,8 @@ authors = ["merl <merl.001.mia@gmail.com>"]
 edition = "2021"
 
 [dependencies]
+oneshot = { git = "https://github.com/merl-twin/oneshot.git" }
+
 crossbeam = "0.8"
 log = "0.4"
 
