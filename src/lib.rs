@@ -15,7 +15,6 @@ pub struct FileEvent<T> {
 #[derive(Debug,Clone)]
 pub enum FileContent {
     Text(String),
-    Remove,
     Error(String),
 }
 impl From<std::io::Error> for FileContent {
@@ -236,7 +235,9 @@ impl<T: Clone> FileWatcherInner<T> {
                                 }
                             },
                         },
-                        Err(_) => to_remove.push(path.clone()),
+                        Err(_) => {
+                            to_remove.push(path.clone());
+                        },
                     },
                     false => continue,
                 },
