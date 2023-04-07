@@ -173,11 +173,13 @@ impl<T: Clone> FileWatcherInner<T> {
                 },
                 None => {
                     if let Some(w) = FileWatcherInner::init(opaque,tp,result,&path) {
+                        log::info!("Watch SET: {}",path.to_string_lossy());
                         self.tasks.insert(path,w);
                     }
                 },
             },
             WatchTask::Unwatch(path) => {
+                log::warn!("Watch removed: {}",path.to_string_lossy());
                 self.tasks.remove(&path);
             },
         }
@@ -245,6 +247,7 @@ impl<T: Clone> FileWatcherInner<T> {
             }
         }
         for path in to_remove {
+            log::warn!("Watch removed: {}",path.to_string_lossy());
             self.tasks.remove(&path);
         }
     }
